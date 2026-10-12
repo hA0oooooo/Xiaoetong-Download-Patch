@@ -18,7 +18,7 @@ import requests
 from .downloads import DownloadPaused
 from .network import make_session
 
-SEGMENT_PREFETCH = 6
+SEGMENT_PREFETCH = 4
 
 
 def https_url(url):
@@ -233,7 +233,7 @@ class MediaProxy:
             return response.status_code, headers, b"".join(chunks)
 
     def prefetch_segment(self, path):
-        # Keep only six segment futures, even for out-of-order or range requests.
+        # Bound the cache even for out-of-order or range requests.
         with self.lock:
             position = self.segment_positions[path]
             if path not in self.prefetched:

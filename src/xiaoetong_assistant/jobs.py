@@ -1,5 +1,6 @@
 """One shared resource download path for GUI and CLI."""
 from concurrent.futures import ThreadPoolExecutor
+from itertools import zip_longest
 import queue
 import threading
 from urllib.parse import urlparse
@@ -8,7 +9,15 @@ from .downloads import DownloadPaused, safe_name, download_file
 from .media import download_hls, select_stream, inspect_mp4
 from .documents import document_format, download_document
 
-MAX_CONCURRENT_DOWNLOADS = 5
+MAX_CONCURRENT_DOWNLOADS = 8
+
+
+def ordered_resources(items):
+    """Alternate video and document jobs, preserving order within each kind."""
+    videos, documents, other = [], [], []
+    for item in items:
+        (videos if item.resource_type == 3 else documents if item.resource_type == 51 else other).append(item)
+    return [item for pair in zip_longest(videos, documents) for item in pair if item is not None] + other
 
 
 def download_resource(client, item, destination, cancel, progress=lambda *_: None):
@@ -53,13 +62,14 @@ def download_batch(client_factory, items, destination, cancel, notify, max_worke
         raise ValueError("At least one download worker is required")
     pending = queue.Queue()
     output_locks = {}
+    items = ordered_resources(items)
     for number, item in enumerate(items, 1):
         stem = safe_name(item.title).casefold()
         for extension in (".mp4", ".pdf", ".docx", ".doc"):
             if stem.endswith(extension):
                 stem = stem[:-len(extension)]
                 break
-        identity = (safe_name(item.course_title).casefold(), stem)
+        identity = (safe_name(item.course_title).casefold(), item.resource_type, stem)
         lock = output_locks.setdefault(identity, threading.Lock())
         pending.put((number, item, lock))
     counts = [0, 0, 0]  # completed, failed, existing

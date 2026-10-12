@@ -9,8 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from xiaoetong_assistant.downloads import DownloadPaused
-from xiaoetong_assistant.jobs import download_batch
-from xiaoetong_assistant.media import MediaProxy, download_hls, inspect_mp4
+from xiaoetong_assistant.jobs import MAX_CONCURRENT_DOWNLOADS, download_batch, ordered_resources
+from xiaoetong_assistant.media import SEGMENT_PREFETCH, MediaProxy, download_hls, inspect_mp4
 from xiaoetong_assistant.native import NativeResource
 
 
@@ -19,8 +19,9 @@ def item(title):
 
 
 class BatchTests(unittest.TestCase):
-    def test_five_concurrent_workers_own_sessions_and_report_monotonic_totals(self):
-        barrier = threading.Barrier(5, timeout=5)
+    def test_concurrent_workers_own_sessions_and_report_monotonic_totals(self):
+        count = MAX_CONCURRENT_DOWNLOADS * 2
+        barrier = threading.Barrier(MAX_CONCURRENT_DOWNLOADS, timeout=5)
         clients, events = [], queue.Queue()
         lock = threading.Lock()
         active = peak = 0
@@ -40,18 +41,18 @@ class BatchTests(unittest.TestCase):
             with lock:
                 active -= 1
         with patch("xiaoetong_assistant.jobs.download_resource", side_effect=download):
-            counts = download_batch(factory, [item(str(i)) for i in range(10)], Path("unused"),
+            counts = download_batch(factory, [item(str(i)) for i in range(count)], Path("unused"),
                                     threading.Event(), events.put)
-        self.assertEqual(counts, (10, 0, 0))
-        self.assertEqual(peak, 5)
-        self.assertEqual(len(clients), 5)
+        self.assertEqual(counts, (count, 0, 0))
+        self.assertEqual(peak, MAX_CONCURRENT_DOWNLOADS)
+        self.assertEqual(len(clients), MAX_CONCURRENT_DOWNLOADS)
         self.assertTrue(all(c.close.call_count == 1 for c in clients))
         totals = [e[1] for e in list(events.queue) if e[0] == "batch"]
-        self.assertEqual(totals, list(range(1, 11)))
+        self.assertEqual(totals, list(range(1, count + 1)))
 
     def test_cancel_stops_active_tasks_and_does_not_start_queued_tasks(self):
         cancel, events = threading.Event(), queue.Queue()
-        barrier = threading.Barrier(5, timeout=5)
+        barrier = threading.Barrier(MAX_CONCURRENT_DOWNLOADS, timeout=5)
         started = []
         def download(client, resource, destination, cancel, progress):
             started.append(resource.key)
@@ -60,9 +61,38 @@ class BatchTests(unittest.TestCase):
             raise DownloadPaused()
         with patch("xiaoetong_assistant.jobs.download_resource", side_effect=download):
             counts = download_batch(Mock, [item(str(i)) for i in range(20)], Path("unused"), cancel, events.put)
-        self.assertEqual(len(started), 5)
+        self.assertEqual(len(started), MAX_CONCURRENT_DOWNLOADS)
         self.assertEqual(counts, (0, 0, 0))
-        self.assertEqual(sum(e[0] == "job" and e[2] == "已停止" for e in list(events.queue)), 5)
+        self.assertEqual(sum(e[0] == "job" and e[2] == "已停止" for e in list(events.queue)), MAX_CONCURRENT_DOWNLOADS)
+
+    def test_mixed_queue_starts_documents_before_all_videos_finish(self):
+        videos = [item(str(i)) for i in range(10)]
+        docs = [item("doc" + str(i)) for i in range(3)]
+        for resource in docs:
+            resource.resource_type = 51
+        selected = videos + docs
+        expected = [videos[0], docs[0], videos[1], docs[1], videos[2], docs[2]] + videos[3:]
+        self.assertEqual(ordered_resources(selected), expected)
+        started = []
+        with patch("xiaoetong_assistant.jobs.download_resource", side_effect=lambda client, resource, *args: started.append(resource)):
+            counts = download_batch(Mock, selected, Path("unused"), threading.Event(), lambda _: None, max_workers=1)
+        self.assertEqual(started, expected)
+        self.assertEqual(counts, (13, 0, 0))
+        self.assertEqual(selected, videos + docs)
+
+    def test_document_only_and_empty_queues(self):
+        doc = item("doc")
+        doc.resource_type = 51
+        self.assertEqual(ordered_resources([doc]), [doc])
+        self.assertEqual(download_batch(Mock, [], Path("unused"), threading.Event(), lambda _: None), (0, 0, 0))
+
+    def test_same_title_video_and_document_do_not_block_each_other(self):
+        video, document = item("Same"), item("Same.pdf")
+        document.resource_type = 51
+        barrier = threading.Barrier(2, timeout=5)
+        with patch("xiaoetong_assistant.jobs.download_resource", side_effect=lambda *args: barrier.wait()):
+            counts = download_batch(Mock, [video, document], Path("unused"), threading.Event(), lambda _: None, max_workers=2)
+        self.assertEqual(counts, (2, 0, 0))
 
     def test_windows_output_name_collisions_serialize_and_preserve_existing_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,8 +116,8 @@ class BatchTests(unittest.TestCase):
 
 
 class MediaParallelTests(unittest.TestCase):
-    def test_prefetch_overlaps_six_requests_and_serves_exact_bytes_in_order(self):
-        barrier = threading.Barrier(6, timeout=5)
+    def test_prefetch_overlaps_requests_and_serves_exact_bytes_in_order(self):
+        barrier = threading.Barrier(SEGMENT_PREFETCH, timeout=5)
         sessions = []
         completed = threading.Event()
         class Response:
@@ -109,7 +139,7 @@ class MediaParallelTests(unittest.TestCase):
             session = Session()
             sessions.append(session)
             return session
-        mapping = {f"/segment/{i}": f"https://cdn.invalid/{i}" for i in range(6)}
+        mapping = {f"/segment/{i}": f"https://cdn.invalid/{i}" for i in range(SEGMENT_PREFETCH)}
         with patch("xiaoetong_assistant.media.make_session", side_effect=factory):
             with MediaProxy("playlist", mapping, None, threading.Event(),
                             lambda done, total, size: completed.set() if done == total else None) as proxy:
