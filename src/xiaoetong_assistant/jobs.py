@@ -1,9 +1,14 @@
 """One shared resource download path for GUI and CLI."""
+from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 from urllib.parse import urlparse
 
-from .downloads import safe_name, download_file
+from .downloads import DownloadPaused, safe_name, download_file
 from .media import download_hls, select_stream, inspect_mp4
 from .documents import document_format, download_document
+
+MAX_CONCURRENT_DOWNLOADS = 5
 
 
 def download_resource(client, item, destination, cancel, progress=lambda *_: None):
@@ -40,3 +45,64 @@ def download_resource(client, item, destination, cancel, progress=lambda *_: Non
         download_document(info, file, cancel, report)
         return file, {"format": extension}
     raise ValueError("Unsupported resource type")
+
+
+def download_batch(client_factory, items, destination, cancel, notify, max_workers=MAX_CONCURRENT_DOWNLOADS):
+    """Bounded workers own separate sessions; colliding output names serialize."""
+    if max_workers < 1:
+        raise ValueError("At least one download worker is required")
+    pending = queue.Queue()
+    output_locks = {}
+    for number, item in enumerate(items, 1):
+        stem = safe_name(item.title).casefold()
+        for extension in (".mp4", ".pdf", ".docx", ".doc"):
+            if stem.endswith(extension):
+                stem = stem[:-len(extension)]
+                break
+        identity = (safe_name(item.course_title).casefold(), stem)
+        lock = output_locks.setdefault(identity, threading.Lock())
+        pending.put((number, item, lock))
+    counts = [0, 0, 0]  # completed, failed, existing
+    count_lock = threading.Lock()
+    total = len(items)
+
+    def worker():
+        client = None
+        try:
+            while not cancel.is_set():
+                try:
+                    number, item, output_lock = pending.get_nowait()
+                except queue.Empty:
+                    return
+                with output_lock:
+                    if cancel.is_set():
+                        return
+                    notify(("job", item.key, "读取资源…", number, total))
+                    try:
+                        if client is None:
+                            client = client_factory()
+                        def progress(state):
+                            notify(("job", item.key, state, number, total))
+                        download_resource(client, item, destination, cancel, progress)
+                        result, state = 0, "完成"
+                    except DownloadPaused:
+                        notify(("job", item.key, "已停止", number, total))
+                        return
+                    except FileExistsError:
+                        result, state = 2, "已存在"
+                    except Exception as error:
+                        result = 1
+                        state = "无观看权限" if isinstance(error, PermissionError) else "格式未支持" if isinstance(error, ValueError) else "下载失败"
+                    notify(("job", item.key, state, number, total))
+                    with count_lock:
+                        counts[result] += 1
+                        notify(("batch", sum(counts), total))
+        finally:
+            if client is not None:
+                client.close()
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, total or 1), thread_name_prefix="download") as executor:
+        futures = [executor.submit(worker) for _ in range(min(max_workers, total))]
+        for future in futures:
+            future.result()
+    return tuple(counts)

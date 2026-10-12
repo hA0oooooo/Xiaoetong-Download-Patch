@@ -1,4 +1,5 @@
 """Native-authorized HLS transport, memory-only keys, and MP4 validation."""
+from concurrent.futures import ThreadPoolExecutor
 import hmac
 import ipaddress
 import math
@@ -12,8 +13,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import requests
+
 from .downloads import DownloadPaused
 from .network import make_session
+
+SEGMENT_PREFETCH = 6
 
 
 def https_url(url):
@@ -92,6 +97,10 @@ def rewrite_playlist(text, source, extension=None):
     return "\n".join(lines) + "\n", mapping, sum(durations), encrypted
 
 
+class _LargeSegment(Exception):
+    pass
+
+
 class MediaProxy:
     def __init__(self, playlist, mapping, key, cancel, progress):
         self.playlist = playlist.encode("utf-8")
@@ -104,6 +113,12 @@ class MediaProxy:
         self.fetch_lock = threading.Lock()
         self.remote_session = make_session()
         self.failure = False
+        self.prefetch = ThreadPoolExecutor(max_workers=SEGMENT_PREFETCH, thread_name_prefix="segment")
+        self.prefetched = {}
+        self.segment_paths = list(mapping)
+        self.segment_positions = {path: index for index, path in enumerate(self.segment_paths)}
+        self.local = threading.local()
+        self.prefetch_sessions = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -120,6 +135,19 @@ class MediaProxy:
                     self.respond(owner.key, "application/octet-stream")
                 elif self.path in owner.mapping:
                     try:
+                        if not self.headers.get("Range"):
+                            buffered = owner.prefetch_segment(self.path)
+                            if buffered is not None:
+                                status, headers, body = buffered
+                                self.send_response(status)
+                                self.send_header("Content-Type", "application/octet-stream")
+                                self.send_header("Cache-Control", "no-store")
+                                for field, value in headers.items():
+                                    self.send_header(field, value)
+                                self.end_headers()
+                                self.wfile.write(body)
+                                owner.complete(self.path, len(body))
+                                return
                         with owner.fetch_lock:
                             headers = {"Accept-Encoding": "identity"}
                             if self.headers.get("Range"):
@@ -143,10 +171,7 @@ class MediaProxy:
                                         raise DownloadPaused()
                                     self.wfile.write(chunk)
                                     written += len(chunk)
-                                with owner.lock:
-                                    owner.bytes += written
-                                    owner.completed.add(self.path)
-                                    owner.progress(len(owner.completed), len(owner.mapping), owner.bytes)
+                                owner.complete(self.path, written)
                     except Exception:
                         owner.failure = True
                         self.close_connection = True
@@ -164,6 +189,71 @@ class MediaProxy:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
+    def complete(self, path, size):
+        with self.lock:
+            self.bytes += size
+            self.completed.add(path)
+            self.progress(len(self.completed), len(self.mapping), self.bytes)
+
+    def fetch_segment(self, path):
+        for attempt in range(3):
+            try:
+                return self.fetch_segment_once(path)
+            except requests.RequestException as error:
+                if isinstance(error, requests.HTTPError) and error.response is not None:
+                    if error.response.status_code < 500 and error.response.status_code != 429:
+                        raise
+                if attempt == 2:
+                    raise
+                if self.cancel.wait(0.3 * (attempt + 1)):
+                    raise DownloadPaused()
+
+    def fetch_segment_once(self, path):
+        if self.cancel.is_set():
+            raise DownloadPaused()
+        if not hasattr(self.local, "session"):
+            self.local.session = make_session()
+            with self.lock:
+                self.prefetch_sessions.append(self.local.session)
+        with self.local.session.get(self.mapping[path], headers={"Accept-Encoding": "identity"},
+                                    stream=True, timeout=(10, 25)) as response:
+            response.raise_for_status()
+            if response.status_code not in (200, 206):
+                raise ValueError("Invalid segment response")
+            chunks, size = [], 0
+            for chunk in response.iter_content(256 * 1024):
+                if self.cancel.is_set():
+                    raise DownloadPaused()
+                size += len(chunk)
+                if size > 32 * 1024 * 1024:
+                    raise _LargeSegment()
+                chunks.append(chunk)
+            headers = {field: response.headers[field] for field in ("Content-Length", "Content-Range")
+                       if field in response.headers}
+            return response.status_code, headers, b"".join(chunks)
+
+    def prefetch_segment(self, path):
+        # Keep only six segment futures, even for out-of-order or range requests.
+        with self.lock:
+            position = self.segment_positions[path]
+            if path not in self.prefetched:
+                if len(self.prefetched) >= SEGMENT_PREFETCH:
+                    return None
+                self.prefetched[path] = self.prefetch.submit(self.fetch_segment, path)
+            for upcoming in self.segment_paths[position + 1:position + SEGMENT_PREFETCH]:
+                if len(self.prefetched) >= SEGMENT_PREFETCH:
+                    break
+                if upcoming not in self.prefetched and upcoming not in self.completed:
+                    self.prefetched[upcoming] = self.prefetch.submit(self.fetch_segment, upcoming)
+            future = self.prefetched[path]
+        try:
+            return future.result()
+        except _LargeSegment:
+            return None  # Stream unusually large segments without buffering them.
+        finally:
+            with self.lock:
+                self.prefetched.pop(path, None)
+
     def __enter__(self):
         self.thread.start()
         return self
@@ -172,6 +262,10 @@ class MediaProxy:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
+        self.prefetch.shutdown(wait=True, cancel_futures=True)
+        for session in self.prefetch_sessions:
+            session.close()
+        self.prefetched.clear()
         self.remote_session.close()
         self.key = None
 
@@ -183,7 +277,7 @@ def ffmpeg_exe():
 
 def inspect_mp4(file, expected_duration=None):
     executable = ffmpeg_exe()
-    result = subprocess.run([executable, "-hide_banner", "-i", str(file)], capture_output=True, text=True, errors="replace", timeout=20)
+    result = subprocess.run([executable, "-hide_banner", "-i", str(file)], capture_output=True, text=True, errors="replace", timeout=20, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     info = result.stderr
     duration_match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", info)
     if not duration_match or not re.search(r"Stream .*Video:", info):
@@ -193,7 +287,7 @@ def inspect_mp4(file, expected_duration=None):
     if expected_duration and abs(duration - expected_duration) > max(3, expected_duration * 0.005):
         raise ValueError("Downloaded video duration does not match the playlist")
     for start in (0, max(0, duration - 4)):
-        check = subprocess.run([executable, "-v", "error", "-nostdin", "-ss", str(start), "-i", str(file), "-t", "3", "-f", "null", "-"], capture_output=True, timeout=30)
+        check = subprocess.run([executable, "-v", "error", "-nostdin", "-ss", str(start), "-i", str(file), "-t", "3", "-f", "null", "-"], capture_output=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if check.returncode != 0 or check.stderr.strip():
             raise ValueError("Downloaded video sample failed decoding")
     return {"duration_seconds": round(duration, 3), "has_video": True, "has_audio": bool(re.search(r"Stream .*Audio:", info)), "sample_decode": "passed"}
@@ -246,7 +340,7 @@ def download_hls(video_data, destination, cancel, progress=lambda *_: None):
     try:
         with MediaProxy(playlist, mapping, key, cancel, progress) as proxy, tempfile.TemporaryFile() as errors:
             command = [ffmpeg_exe(), "-nostdin", "-v", "error", "-n", "-protocol_whitelist", "http,tcp,crypto", "-headers", f"Authorization: Bearer {proxy.token}\r\n", "-i", f"http://127.0.0.1:{proxy.server.server_port}/manifest.m3u8", "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(partial)]
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors, env=environment)
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors, env=environment, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
                 while True:
                     try:
@@ -263,6 +357,8 @@ def download_hls(video_data, destination, cancel, progress=lambda *_: None):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+            if cancel.is_set():
+                raise DownloadPaused()
             if code or proxy.failure or len(proxy.completed) != len(mapping):
                 raise RuntimeError("Media transport or remux failed; no completed file published")
             verification = inspect_mp4(partial, duration)

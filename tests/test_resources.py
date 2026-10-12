@@ -232,3 +232,39 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(app.summary.get(), "1 个视频 · 0 份文档")
         finally:
             app.close()
+
+
+class CancelButtonTests(unittest.TestCase):
+    def test_cancel_button_stops_batch_keeps_window_and_reenables_download(self):
+        import threading
+        from xiaoetong_assistant.downloads import DownloadPaused
+        root = tk.Tk()
+        root.withdraw()
+        app = Application(root, connect=False)
+        started = threading.Event()
+        def download(client, item, destination, cancel, progress):
+            started.set()
+            if not cancel.wait(5):
+                raise RuntimeError("Cancellation was not delivered")
+            raise DownloadPaused()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                app.populate_catalog(VideoCatalog(resources=[resource("cancel-test")]), reset=True)
+                app.set_checked(list(app.table.get_children()))
+                app.folder.set(directory)
+                with patch("xiaoetong_assistant.app.NativeClient", return_value=Mock()), patch("xiaoetong_assistant.jobs.download_resource", side_effect=download):
+                    app.download()
+                    self.assertTrue(started.wait(3))
+                    app.update_button()
+                    self.assertNotIn("disabled", app.cancel_button.state())
+                    app.cancel_button.invoke()
+                    app.worker.join(timeout=5)
+                    self.assertFalse(app.worker.is_alive())
+                    app.poll()
+                self.assertTrue(root.winfo_exists())
+                self.assertFalse(app.closing)
+                self.assertIn("disabled", app.cancel_button.state())
+                self.assertNotIn("disabled", app.button.state())
+                self.assertTrue(app.status.get().startswith("已取消"))
+        finally:
+            app.close()

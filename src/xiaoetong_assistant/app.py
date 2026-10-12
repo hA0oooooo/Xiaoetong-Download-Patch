@@ -6,9 +6,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from .downloads import DownloadPaused
 from .folder_picker import choose_directory
-from .jobs import download_resource
+from .jobs import download_batch
 from .native import NativeClient
 from .service import discover_videos, selected_resources
 
@@ -21,6 +20,7 @@ class Application:
         self.events = queue.Queue()
         self.cancel = threading.Event()
         self.worker = None
+        self.downloading = False
         self.closing = False
         self.resources = {}
         self.checked = set()
@@ -53,6 +53,8 @@ class Application:
         ttk.Button(controls, text="保存目录", command=self.choose_folder).pack(side="left", padx=8)
         self.button = ttk.Button(controls, text="下载选中资源", command=self.download, state="disabled")
         self.button.pack(side="left")
+        self.cancel_button = ttk.Button(controls, text="取消下载", command=self.cancel_download, state="disabled")
+        self.cancel_button.pack(side="left", padx=(8, 0))
         ttk.Label(root, textvariable=self.summary, padding=(12, 8)).pack(anchor="w")
         self.folder.trace_add("write", lambda *_: self.update_button())
         self.table.bind("<<TreeviewSelect>>", lambda _: self.update_button())
@@ -70,6 +72,7 @@ class Application:
         count = len(self.checked)
         self.button.configure(text=f"下载选中资源 ({count})" if count else "下载选中资源",
                               state="normal" if count and self.folder.get().strip() and not busy else "disabled")
+        self.cancel_button.configure(state="normal" if self.downloading and busy and not self.cancel.is_set() else "disabled")
 
     def create_check_images(self):
         images = {}
@@ -234,43 +237,27 @@ class Application:
             self.status.set("保存目录无效")
             return
         self.cancel.clear()
+        self.downloading = True
         self.button.configure(state="disabled")
 
         def run():
-            client = None
-            succeeded = failed = skipped = 0
             try:
-                client = NativeClient(self.project)
-                for number, item in enumerate(selected, 1):
-                    if self.cancel.is_set():
-                        break
-                    self.events.put(("job", item.key, "读取资源…", number, len(selected)))
-                    try:
-                        def progress(state, key=item.key, n=number):
-                            self.events.put(("job", key, state, n, len(selected)))
-                        download_resource(client, item, destination, self.cancel, progress)
-                        succeeded += 1
-                        self.events.put(("job", item.key, "完成", number, len(selected)))
-                    except DownloadPaused:
-                        self.events.put(("job", item.key, "已停止", number, len(selected)))
-                        break
-                    except FileExistsError:
-                        skipped += 1
-                        self.events.put(("job", item.key, "已存在", number, len(selected)))
-                    except Exception as error:
-                        failed += 1
-                        state = "无观看权限" if isinstance(error, PermissionError) else "格式未支持" if isinstance(error, ValueError) else "下载失败"
-                        self.events.put(("job", item.key, state, number, len(selected)))
-                self.events.put(("finished", succeeded, failed, skipped))
+                counts = download_batch(lambda: NativeClient(self.project), selected, destination,
+                                        self.cancel, self.events.put)
+                self.events.put(("finished", *counts))
             except Exception:
                 self.events.put(("download_error",))
             finally:
-                if client:
-                    client.close()
                 self.events.put(("idle",))
 
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
+
+    def cancel_download(self):
+        if self.downloading and self.worker and self.worker.is_alive():
+            self.cancel.set()
+            self.cancel_button.configure(state="disabled")
+            self.status.set("正在取消下载…")
 
     def poll(self):
         if self.poll_after is not None:
@@ -305,12 +292,16 @@ class Application:
                     self.connect_after = self.root.after(5000, self.connect)
                 elif kind == "job":
                     self.table.set(event[1], "state", event[2])
-                    self.status.set(f"下载 {event[3]}/{event[4]}")
+                    self.status.set(f"下载中 · 共 {event[4]} 项")
+                elif kind == "batch":
+                    self.status.set(f"已处理 {event[1]}/{event[2]}")
                 elif kind == "finished":
-                    self.status.set(f"完成 {event[1]} · 已存在 {event[3]} · 未完成 {event[2]}")
+                    prefix = "已取消 · " if self.cancel.is_set() else ""
+                    self.status.set(prefix + f"完成 {event[1]} · 已存在 {event[3]} · 未完成 {event[2]}")
                 elif kind == "download_error":
                     self.status.set("下载失败：请检查小鹅通学员客户端登录")
                 elif kind == "idle":
+                    self.downloading = False
                     self.update_button()
         except queue.Empty:
             pass
