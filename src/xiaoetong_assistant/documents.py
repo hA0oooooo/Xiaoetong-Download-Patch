@@ -36,8 +36,16 @@ def validate_document(file, extension):
     raise ValueError("Document content does not match its format")
 
 
+def document_url(url):
+    # Some native course attachments advertise HTTP CDN addresses. Use TLS
+    # while preserving the original signed path/query; never fall back to HTTP.
+    parsed = urlparse(url)
+    url = parsed._replace(scheme="https").geturl() if parsed.scheme == "http" else url
+    return https_url(url)
+
+
 def download_document(info, destination, cancel, progress=lambda *_: None):
     extension = document_format(info)
-    https_url(info["file_url"])
-    return download_file(info["file_url"], destination, cancel, progress,
+    url = document_url(info["file_url"])
+    return download_file(url, destination, cancel, progress,
                          validate=lambda file: validate_document(file, extension))

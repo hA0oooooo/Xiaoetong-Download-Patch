@@ -56,6 +56,26 @@ test('rejects non-list/write endpoints before issuing a fetch',async()=>{
   assert.equal(electron.requests.length,0);
 });
 
+test('sidebar materials require course access and preserve preview-only restrictions',async()=>{
+  const rows=[
+    {material_id:'pdf',title:'Notes.pdf',type:9,operate_type:1,url:'https://example.invalid/notes.pdf'},
+    {material_id:'preview',title:'Preview.pdf',type:9,operate_type:2,url:'https://example.invalid/preview.pdf'},
+    {material_id:'slides',title:'Slides.pptx',type:7,operate_type:1,url:'https://example.invalid/slides.pptx'},
+  ];
+  const request={action:'courseware',app_id:'a',user_id:'u',course_id:'c'};
+  const electron=mockElectron(url=>url.includes('resource_catalog_list')?{code:0,data:{available:1,subscribe:1}}:{code:0,data:rows});
+  const result=await dispatch(electron,request);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.data.list)),[
+    {material_id:'pdf',title:'Notes.pdf',type:9,file_url:'https://example.invalid/notes.pdf'},
+  ]);
+  assert.equal(electron.requests.length,2);
+  for(const flags of [{available:0,subscribe:1},{available:1,subscribe:0},{available:1,subscribe:1,is_ban:1},{available:1,subscribe:1,is_try:1}]) {
+    const denied=mockElectron({code:0,data:flags});
+    assert.equal((await dispatch(denied,request)).payload.code,'courseware_access_denied');
+    assert.equal(denied.requests.length,1);
+  }
+});
+
 test('resolves normal authorized video metadata through the native SDK',async()=>{
   const streams = [{url:'https://example.invalid/video.mp4',is_support:0}];
   const electron = mockElectron({code:0,data:{video_info:{material_id:'m'},video_urls:JSON.stringify(streams)}});

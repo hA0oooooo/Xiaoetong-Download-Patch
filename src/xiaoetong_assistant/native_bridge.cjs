@@ -116,6 +116,25 @@ async function dispatch(electron, message) {
     if (!ENDPOINTS.has(message.endpoint) || !message.body || typeof message.body !== 'object' || Array.isArray(message.body)) throw Error('unsupported_request');
     return page.executeJavaScript(pageRequest(message.endpoint, message.body));
   }
+  if (message.action === 'courseware') {
+    const {app_id,user_id,course_id} = message;
+    if (![app_id,user_id,course_id].every(value=>typeof value==='string' && value.length>0 && value.length<256)) throw Error('invalid_course_identity');
+    const access=await page.executeJavaScript(pageRequest('/xe.pc_client.course.business.avoidlogin.e_course.resource_catalog_list.get/1.0.0',{
+      app_id,user_id,buz_data:{resource_id:'',course_id,p_id:'0',order:'asc',page:1,page_size:20,sub_course_id:''},
+    }));
+    if (String(access.payload?.code)!=='0') return access;
+    const flags=access.payload.data;
+    if (![true,1,'1'].includes(flags?.available) || ![true,1,'1'].includes(flags?.subscribe) ||
+        [true,1,'1'].includes(flags?.is_ban) || [true,1,'1'].includes(flags?.is_try)) return {payload:{code:'courseware_access_denied'}};
+    const result=await page.executeJavaScript(pageRequest('/xe.pc_client.course.business.courseware_list.get/2.0.0',{
+      app_id,user_id,buz_data:{resource_id:course_id,resource_type:50},
+    }));
+    if (String(result.payload?.code)!=='0') return result;
+    if (!Array.isArray(result.payload.data)) throw Error('unsupported_courseware_response');
+    const list=result.payload.data.filter(row=>[6,9].includes(Number(row.type)) && Number(row.operate_type)!==2 && typeof row.url==='string' && row.url)
+      .map(row=>({material_id:row.material_id,title:row.title,type:Number(row.type),file_url:row.url}));
+    return {payload:{code:0,data:{list}}};
+  }
   if (message.action === 'video') {
     const {app_id, user_id, resource_id, course_id = ''} = message;
     if (![app_id, user_id, resource_id].every(value => typeof value === 'string' && value.length > 0 && value.length < 256) || typeof course_id !== 'string') throw Error('invalid_video_identity');

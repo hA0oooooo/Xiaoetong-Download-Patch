@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
 from xiaoetong_assistant.app import Application
-from xiaoetong_assistant.documents import document_format, validate_document
+from xiaoetong_assistant.documents import document_format, validate_document, download_document
 from xiaoetong_assistant.native import NativeResource
 from xiaoetong_assistant.service import VideoCatalog, selected_resources
 from xiaoetong_assistant.media import select_stream
@@ -19,6 +19,23 @@ def resource(id, kind=3):
 
 
 class ResourceTests(unittest.TestCase):
+    def test_http_attachment_uses_https_without_changing_signature(self):
+        with patch("xiaoetong_assistant.documents.download_file") as download:
+            download_document({"file_name":"Notes.pdf","file_url":"http://example.invalid/notes.pdf?signature=keep"},Path("Notes.pdf"),threading.Event())
+        self.assertEqual(download.call_args.args[0], "https://example.invalid/notes.pdf?signature=keep")
+
+    def test_sidebar_download_resolves_current_course_material(self):
+        client = Mock()
+        item = resource("notes.pdf", 51)
+        item.source = "courseware"
+        client.courseware_document.return_value = {"file_name":"notes.pdf","file_url":"https://example.invalid/notes.pdf"}
+        with tempfile.TemporaryDirectory() as folder, patch("xiaoetong_assistant.jobs.download_document") as download:
+            path, info = download_resource(client,item,Path(folder),threading.Event())
+        client.document.assert_not_called()
+        client.courseware_document.assert_called_once_with(**item.video_identity())
+        self.assertEqual(path.name,"notes.pdf")
+        download.assert_called_once()
+
     def test_incremental_catalog_displays_roots_early_and_keeps_user_checks(self):
         root = tk.Tk()
         root.withdraw()

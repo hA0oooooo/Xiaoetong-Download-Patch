@@ -8,7 +8,25 @@ class NativeTests(unittest.TestCase):
     def client(self, responses):
         client = NativeClient.__new__(NativeClient)
         client.post = Mock(side_effect=responses)
+        client.courseware = Mock(return_value=[])
         return client
+
+    def test_sidebar_documents_are_included_without_signed_addresses(self):
+        client = self.client([{"available":1,"subscribe":1,"list":[],"total":0}])
+        client.courseware.return_value = [
+            {"material_id":"notes","title":"Notes.pdf","type":9,"file_url":"https://example.invalid/notes.pdf?private=x"},
+            {"material_id":"word","title":"Notes.docx","type":6,"file_url":"https://example.invalid/notes.docx"},
+        ]
+        items = client.resources({"resource_type":50,"resource_id":"c","app_id":"a","user_id":"u"})
+        self.assertEqual([v.title for v in items], ["Notes.pdf","Notes.docx"])
+        self.assertTrue(all(v.source == "courseware" and v.resource_type == 51 for v in items))
+        self.assertNotIn("private=x", repr(items))
+        self.assertIn(":courseware:", items[0].key)
+
+    def test_removed_sidebar_document_is_denied(self):
+        client = self.client([])
+        with self.assertRaises(PermissionError):
+            client.courseware_document("a", "u", "c", "removed")
 
     def test_paginates_all_authorized_course_rows(self):
         client = self.client([

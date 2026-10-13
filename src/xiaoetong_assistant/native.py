@@ -17,9 +17,12 @@ class NativeResource:
     resource_type: int
     unlocked: bool
     trial: bool
+    source: str = "catalog"
 
     @property
     def key(self):
+        if self.source == "courseware":
+            return f"{self.app_id}:{self.course_id}:courseware:{self.resource_id}"
         return f"{self.app_id}:{self.course_id}:{self.resource_id}"
 
     def video_identity(self):
@@ -102,6 +105,19 @@ class NativeClient:
     def document(self, **identity):
         return self.unwrap(self.call("document", **identity).get("payload"))
 
+    def courseware(self, app_id, user_id, course_id):
+        data = self.unwrap(self.call("courseware", app_id=app_id, user_id=user_id, course_id=course_id).get("payload"))
+        rows = data.get("list")
+        if not isinstance(rows, list):
+            raise ValueError("Unsupported course materials list")
+        return rows
+
+    def courseware_document(self, app_id, user_id, course_id, resource_id):
+        for row in self.courseware(app_id, user_id, course_id):
+            if row.get("material_id") == resource_id:
+                return {"file_url": row["file_url"], "file_name": row["title"]}
+        raise PermissionError("Course material is no longer available")
+
     def resources(self, course):
         """Enumerate the observed type-50 course tree without treating folders as videos."""
         if int(course.get("resource_type", 0)) != 50:
@@ -157,4 +173,17 @@ class NativeClient:
             raise ValueError("Chapter pagination limit reached")
 
         walk()
+        # Sidebar attachments are independent of the chapter catalog. Keep their
+        # signed addresses out of catalog objects; resolve again at download time.
+        for row in self.courseware(app_id, user_id, course_id):
+            identity, title = row.get("material_id"), row.get("title")
+            if not isinstance(identity, str) or not identity or not isinstance(title, str) or not title:
+                raise ValueError("Missing course material identity or title")
+            if not title.lower().endswith((".pdf", ".doc", ".docx")):
+                if row.get("type") == 9:
+                    title += ".pdf"
+                else:
+                    continue
+            resource = NativeResource(app_id,user_id,course_id,identity,title,str(course.get("title",course_id)),51,True,False,"courseware")
+            resources[resource.key] = resource
         return list(resources.values())

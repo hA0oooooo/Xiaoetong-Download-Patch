@@ -177,7 +177,7 @@ class DownloadTests(unittest.TestCase):
                 Handler.documents[url] = content
                 destination = Path(self.temp.name) / ("sample." + extension)
                 info = {"file_url": self.base + url}
-                with patch("xiaoetong_assistant.documents.https_url", lambda url: url):
+                with patch("xiaoetong_assistant.documents.document_url", lambda url: url):
                     download_document(info, destination, self.cancel)
                 self.assertEqual(destination.read_bytes(), content)
         finally:

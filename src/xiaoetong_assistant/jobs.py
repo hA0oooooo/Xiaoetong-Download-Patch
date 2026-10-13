@@ -43,7 +43,8 @@ def download_resource(client, item, destination, cancel, progress=lambda *_: Non
             return file, {"definition": quality, **inspect_mp4(file)}
         return file, download_hls(data, file, cancel, report)
     if item.resource_type == 51:
-        info = client.document(**item.video_identity())
+        resolve = client.courseware_document if item.source == "courseware" else client.document
+        info = resolve(**item.video_identity())
         extension = document_format(info)
         name = safe_name(item.title)
         if name.lower().endswith("." + extension):
